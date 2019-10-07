@@ -1,0 +1,418 @@
+---
+title: "New York City Tree Census and Air Quality Analysis"
+author: "Faisal Mushayt, Allen Qu, Zach Halvorson, Temma Pelletier"
+output: html_document
+---
+
+# Introduction
+
+We plan on starting with a NY tree census dataset, and investigating any potential factors within that dataset. Additionally, we will investigate any potential relationships between our tree census dataset and a NYC air quality dataset we found. 
+
+**Data sets we plan to use:**
+
+**NYC Tree Census:**
+This dataset includes a record for every tree in New York City and includes the tree's location by borough and latitude/longitude, species by Latin name and common names, size, health, and issues with the tree's roots, trunk, and branches:
+https://www.kaggle.com/nycparks/tree-census#new_york_tree_census_2015.csv
+
+**NYC Air Quality:**
+This dataset contains information on New York City air quality surveillance data:
+https://data.cityofnewyork.us/Environment/Air-Quality/c3uy-2p5r
+
+**Questions we want to investigate:**
+Tree density related to air quality indicators per borough.
+Tree specific questions - stump diameter vs. species, other physical qualities?
+Tree species resilience/survivability - how the tree condition changes from 1995 - 2015.
+Tree healthiness given air quality
+
+**Unique visualizations we’d like to create**
+Interactive map of NY with trees plotted by latitude and longitude, colored by another factor(air quality, species of tree, etc.). Facet wraps or violin plots might also be interesting.
+
+
+# Set-Up
+
+```{r libs, warning = FALSE, message = FALSE}
+library(tidyverse)
+library(anchors)
+library(dplyr)
+library(modelr)
+library(sf)
+library(tmap)
+library(rmarkdown)
+library(anchors)
+library(leaflet)
+library(tmaptools)
+source("hf.R")
+```
+
+# Importing the data 
+
+First we import the tree census data into three separate variable for each year, and another variable for the species information
+
+```{r tree_data_read, output.lines = 10, warning = FALSE, message = FALSE}
+
+# Load the data
+tree_1995_raw <- read_csv("data/new_york_tree_census_1995.csv")
+tree_2005_raw <- read_csv("data/new_york_tree_census_2005.csv")
+tree_2015_raw <- read_csv("data/new_york_tree_census_2015.csv")
+
+#Here we save a copy of the dataset so that we always have the dataset saved in a variable
+tree_1995 <- tree_1995_raw
+tree_2005 <- tree_2005_raw
+tree_2015 <- tree_2015_raw
+
+#Print 1995 for example
+tree_1995
+
+```
+
+## Longitude and Latitude clean up
+
+Note how other than in the 2005 dataset, every entry describes a single tree. The issue with 2005 dataset is that "New York", and the longitude and latitude appear on separate rows above and below the tree entry respectively. This section deals with that issue by combinging them to match the 1995 and 2015 format. 
+
+```{r tree_data_2005_clean, output.lines = 10, warning = FALSE, message=FALSE}
+
+# First drop all the rows that just say "New York"
+tree_2005_clean <- tree_2005 %>% filter(objectid != "New York") 
+
+# Create a data set containing all the lats and lons
+lonlats <-  tree_2005_clean %>% filter(is.na(cen_year))  %>% 
+transmute(latitude = str_extract(objectid, "^.+\\s") %>% str_sub(2,) %>% as.numeric(), longitude = str_extract(objectid, "\\s.+") %>% str_sub(,-2) %>% as.numeric())
+
+# Create the position vectors
+lats <- lonlats[1]
+lons <- lonlats[2]
+
+# Add the position vectors back to the cleaned up dataset
+tree_2005<- tree_2005_clean %>% filter(!is.na(cen_year)) %>% cbind(latitude = lats, longitude = lons)
+
+```
+
+We check this by comparing the number of rows before and after wrangling, where 1,777,116 rows are in the intitial datase and 592,372 rows are in the final dataset. This is exactly 1/3 of the original dataset, which likely indicates that we cleaned the data correctly.
+
+## Matching variable names
+
+Next we will rename variables accross the datasets to ensure consistency and add a year variable to keep track of the records once we combine all of the datasets
+
+```{r tree_data_variable_consistency}
+
+tree_1995$year <- "1995"
+tree_2005$year <- "2005"
+tree_2015$year <- "2015"
+
+names(tree_1995)[names(tree_1995)=="recordid"] <- "tree_id"
+names(tree_2005)[names(tree_2005)=="objectid"] <- "tree_id"
+
+tree_2005$sidewalk_condition <- NA
+
+names(tree_1995)[names(tree_1995)=="status"] <- "health"
+names(tree_2005)[names(tree_2005)=="status"] <- "health"
+
+names(tree_2015)[names(tree_2015)=="sidewalk"] <- "sidewalk_condition"
+
+names(tree_2005)[names(tree_2005)=="boroname"] <- "borough"
+names(tree_2015)[names(tree_2015)=="boroname"] <- "borough"
+
+tree_2005$borough[tree_2005$borough == 5] <- "Staten Island"
+
+
+
+```
+
+Here we select the variables that we want to save in our subsetted variable
+
+```{r tree_data_subset_creation}
+
+myvars <- c("tree_id", "borough", "spc_latin", "year")
+sub_tree_1995 <- tree_1995[myvars]
+sub_tree_2005 <- tree_2005[myvars]
+sub_tree_2015 <- tree_2015[myvars]
+sub_all_years <- rbind(sub_tree_1995, sub_tree_2005, sub_tree_2015)
+```
+
+# Species Snapshot
+
+Here we examine the rate at which particular types of trees occur in particular boroughs by first grouping the species of trees by their genuses
+
+```{r species_snapshot, output.lines = 10, warning = FALSE, message=FALSE}
+
+#genuses are the first word of a species' latin name, so here we select only the first word of the latin names to extract genus
+tree_1995_species <- tree_1995 %>% mutate(genus = word(spc_latin, 1, 1))
+tree_2005_species <- tree_2005 %>% mutate(genus = word(spc_latin, 1, 1))
+tree_2015_species <- tree_2015 %>% mutate(genus = word(spc_latin, 1, 1))
+sub_all_years <- sub_all_years %>% mutate(genus = word(spc_latin, 1, 1))
+
+#we combine each year into one table with a count of how many trees of each genus are in each borough
+part_1995 <- tree_1995_species %>% group_by(genus, borough) %>% summarize(count=n()) %>% mutate(year=1995)
+
+part_2005 <- tree_2005_species %>% replace.value(., c("borough"), from='5', to='Staten Island') %>% group_by(genus, borough) %>% summarize(count=n()) %>% mutate(year=2005)
+
+part_2015 <- tree_2015_species %>% mutate(genus = str_to_upper(genus)) %>% group_by(genus, borough) %>% summarize(count=n()) %>% mutate(year=2015)
+
+all_years_genus <- rbind(part_1995, part_2005, part_2015) 
+
+#to make interpretation easier we attach the standardized common name to each genus 
+all_years_common_genus <- all_years_genus %>% group_by(genus) %>% summarize(count=n()) %>% arrange(genus) %>% cbind(name = c("Fir", "Acacia", "Maple", "Palm", "Buckeye", "Tree of Heaven", "Albizia", "Alder", "Shadbush", "Conifer", "Conifer", "Western Redcedar", "Pawpaw", "Birch", "Bishop Wood", "Umbrella Tree", "Mulberry", "Bottlebrush", "Hornbeam", "Hickory", "Chestnut", "Australian Pine", "Catalpa", "Cedar", "Hackberry", "Katsura", "Eastern Redbud", "Cypress", "Fringe Tree", "Cinnamon","Yellowwood", "Buttonwood", "Dogwood", "Hazel", "Smoketree", "Hawthorn", "Sugi", "Cypress", "Persimmon", "Silverberry", "Loquat", "Eucommia", "Beech", "Fig", "Parasol Tree", "Ash", "Ginkgo", "Honey Locust", "Grevillea", "Coffeetree", "Silverbell", "Witch Hazel", "Hedge", "Hibiscus", "Holly", "Walnut", "Juniper", "Golden Rain Tree", "Laburnum", "Crape-myrtle", "Larch", "Privet", "Sweetgum", "Tulip Tree", "Honeysuckle", "Maackia", "Mulberry", "Magnolia", "Apple", "Bead Tree", "Sequoia", "Mulberry", "Bayberry", "Tupelo", "Ostrya", "Sourwood", "Palm", "Ironwood", "Foxglove Tree", "Avocado", "Cork-tree", "Date Palm", "Spruce", "Pine", "Pistachio", "Planting", "Plane", "Plumeria", "Pongamia", "Poplar", "Poplar", "Prunus", "Douglas Fir", "Pear", "Oak", "Black Locust", "Rose", "Palmetto", "Willow", "Tallow Tree", "Sassafras", "Sequoia", "Sequoia", "Shrub", "Pagoda Tree", "Rowan", "Stump", "Pagoda Tree", "Snowbell", "Lilac", "Cherry", "Tabebuia", "Bald Cypress", "Yew", "Western Redcedar", "Basswood", "Hemlock", "Elm", "NA", "NA", "Viburnum", "Zelkova", "NA"))
+
+
+```
+
+```{r tree_data_decade_changes, output.lines=10, warning = FALSE, message=FALSE}
+#Here we will begin comparing the tree census data over the three decades
+
+#To determine if the tree_id is consistent accrosa multiple years we combine all of the datasets, and then check specific values as follows:
+all_years_common_genus <- all_years_common_genus[c("name", "genus")]
+
+#Plots to show the most common genuses accross all of NYC when looking at specific genuses in each borough by year, and then by ignoring the effects of boroughs
+trees_with_common <- sub_all_years %>% left_join(all_years_common_genus, by = "genus") %>% filter(name!= 'NA')
+trees_with_common
+
+trees_with_common %>% group_by(name, borough, year) %>% summarize(count=n()) %>% filter(count > 10000) %>% ggplot() + geom_col(aes(x = name, y = count, fill=name))  + coord_flip() + facet_grid(year~borough)
+
+trees_with_common %>% group_by(name, year) %>% summarize(count=n()) %>% filter(count> 4000) %>% ggplot() + geom_col(aes(x = name, y = count, fill=name)) + coord_flip() + theme(axis.text.x = element_text(angle = 60, hjust = 1)) + facet_wrap(~year)
+
+```
+
+
+# Tree Density Maps
+
+Here we create low alpha map and a colored map to visualize tree density across NYC and identify the most common tree species
+
+```{r map_setup, message=FALSE}
+
+epsg_NY_long_island <- 2263
+epsg_wgs84 <- 4326
+
+tree_1995_map_copy <- tree_1995
+
+#First we create the points to plot
+tree_1995_maps <- tree_1995_map_copy %>% st_as_sf(coords = c("longitude", "latitude")) %>% st_set_crs(epsg_wgs84) %>% st_transform(epsg_NY_long_island)
+
+#Next we import the shape files for the boroughs and convert to epsg_us projection
+nyc_borough <- st_read("data/maps/geo_export_0fee68cc-9bb2-4196-ae41-9ca93a0f4690.shp") %>% st_transform(epsg_NY_long_island)
+
+#Next we create a black and white density map of all trees using alpha
+tm_shape(nyc_borough) + tm_polygons() + tm_shape(tree_1995_maps) + tm_dots(alpha = 0.015) + tm_layout(legend.outside = TRUE, main.title = "NYC - 1995 Trees - Low Alpha")
+
+
+#Next we map the top 5 trees by color
+tree_1995_top_5 <- tree_1995_map_copy %>% group_by(spc_common) %>% mutate(count = n()) %>% filter(count > 31292)
+
+tree_1995_top_5_map <- tree_1995_top_5 %>% st_as_sf(coords = c("longitude", "latitude")) %>% st_set_crs(epsg_wgs84) %>% st_transform(epsg_NY_long_island)
+
+
+tm_shape(nyc_borough) + tm_polygons() + tm_shape(tree_1995_top_5_map) + tm_dots(col = "spc_common", palette = "Accent", n = 5, alpha = 0.1) + tm_layout(legend.outside = TRUE, main.title = "Top 5 Species by Color - 1995", legend.show = FALSE, title = "GREEN - HONEYLOCUST, 
+PURPLE - LONDON PLANETREE, 
+ORANGE - MAPLE NORWAY, 
+YELLOW - OAK PIN, 
+BLUE - PEAR CALLERY ", title.size = 0.7)  
+```
+
+
+# Air Quality 
+
+Here, we analyze the concentration of toxic chemical compounds in NYC in 2005, and 2013
+
+```{r air_quality_read_clean, message=FALSE, warning = FALSE, message=FALSE}
+
+# Read in the air quality data
+air_quality <- read_csv("data/Air_Quality.csv")
+
+# Filter for UHF neighborhoods of NYC, toxic chemical compounds, and years 2005 and 2013
+air_quality <- air_quality %>% 
+  filter(geo_type_name == "UHF42", name == "Air Toxics Concentrations- Average Benzene Concentrations"| name == "Air Toxics Concentrations- Average Formaldehyde Concentrations" | name == "Boiler Emissions- Total NOx Emissions" | name == "Boiler Emissions- Total PM2.5 Emissions" | name == "Boiler Emissions- Total SO2 Emissions" | name == "Neighborhood Air Quality Concentrations- Elemental Carbon (EC)" | name == "Neighborhood Air Quality Concentrations- Fine Particulate Matter (PM2.5)" | name == "Neighborhood Air Quality Concentrations- Nitric Oxide (NO)" | name == "Neighborhood Air Quality Concentrations- Nitrogen Dioxide (NO2)" | name == "Neighborhood Air Quality Concentrations- Ozone (O3)" | name == "Neighborhood Air Quality Concentrations- Ozone (O3)" | name == "Neighborhood Air Quality Concentrations: Sulfur Dioxide (SO2)", year_description == "2005" | year_description == "2013")
+
+# Rename columns for easier readability 
+names(air_quality)[names(air_quality)=="name"] <- "Chemical"
+names(air_quality)[names(air_quality)=="year_description"] <- "Year"
+names(air_quality)[names(air_quality)=="data_valuemessage"] <- "Concentration"
+names(air_quality)[names(air_quality)=="geo_entity_name"] <- "Neighborhood"
+
+# Store in variable so we always have access to original air quality data 
+air_qual <- air_quality
+
+# Plot toxic chemical concentrations in NYC for the years 2005, 2009, and 2013 with boxplots
+# for easier analysis of distribution of data
+air_quality %>%
+    ggplot(aes(x = Year, y = log(Concentration))) + geom_point(aes(color = Chemical)) +
+    geom_boxplot(alpha = 0) + 
+    labs(title = "Concentrations of Toxic Chemicals in NYC", y = "Concentration")
+```
+
+We chose to only focus on the clean 2005 and 2013 data. This way we can two models of tree density vs air quality. The first would be 2005 vs 2005, and 2015 vs 2013 respectively. No air quality data exists for 2015, so we use the closest approximation which is 2013.
+
+## Modeling Tree Density vs. Air Quality
+
+Here we create the datasets required to build our tree density vs air quality model
+
+```{r model_data, message=FALSE}
+
+# 2005 tree data
+tree_2005$health[(tree_2005$health) == "Excellent"]  <- "Good"
+tree_2005$health[(tree_2005$health) == "Dead"]  <- "Bad"
+tree_2005$health[(tree_2005$health) == "Poor"]  <- "Bad"
+
+trees_2005 <- tree_2005 %>% 
+  transmute(zipcode, health) %>%
+  filter(!is.na(zipcode)) %>%
+  mutate("UHF42" = convertUHF((zipcode)))
+
+# tidy air_quality data for joining with tree data
+air_quality <- air_quality %>% 
+  transmute(geo_entity_id, Concentration, Year)
+
+names(air_quality)[names(air_quality) == "geo_entity_id"] <- "UHF42"
+air_quality$UHF42 <- as.character(air_quality$UHF42)
+air_quality_2005 <- air_quality %>% 
+  filter(Year == "2005") %>%
+  full_join((trees_2005))
+
+# Creating the 2005 dataframe of UHF42, AQI, and Tree Density
+model_2005_data <- air_quality %>% filter(Year == "2005") %>% group_by(UHF42) %>% summarise(AQI = mean(Concentration))
+
+logistic_2005 <- model_2005_data %>%
+  full_join(air_quality_2005) %>%
+  filter(!is.na(AQI))
+
+air_quality_2005 <- air_quality_2005 %>% 
+  count(UHF42)
+
+linear_2005 <- model_2005_data %>%
+  full_join(air_quality_2005) %>%
+  filter(!is.na(AQI))
+
+names(linear_2005)[names(linear_2005) == "n"] <- "Tree Density"
+
+# 2015 tree data
+tree_2015$health[(tree_2015$health) == "Fair"]  <- "Good"
+tree_2015$health[(tree_2015$health) == "Poor"]  <- "Bad"
+
+trees_2015 <- tree_2015 %>% 
+  transmute(zipcode, health) %>%
+  filter(!is.na(zipcode)) %>%
+  mutate("UHF42" = convertUHF((zipcode)))
+
+# tidy air_quality data for joining with tree data
+air_quality_2015 <- air_quality %>% 
+  filter(Year == "2013") %>%
+  full_join((trees_2015))
+
+# Creating the 2015 dataframe of UHF42, AQI, and Tree Density
+model_2015_data <- air_quality %>% filter(Year == "2013") %>% group_by(UHF42) %>% summarise(AQI = mean(Concentration))
+
+logistic_2015 <- model_2015_data %>%
+  full_join(air_quality_2015) %>%
+  filter(!is.na(AQI))
+
+air_quality_2015 <- air_quality_2015 %>% 
+   count(UHF42)
+
+linear_2015 <- model_2015_data %>%
+  full_join(air_quality_2015) %>%
+  filter(!is.na(AQI))
+
+names(linear_2015)[names(linear_2015) == "n"] <- "Tree Density"
+
+# final dataframe containing UHF42, AQI, and Tree Density in 2005
+ 
+ linear_2005
+ 
+ logistic_2005 <- logistic_2005 %>%
+   transmute(UHF42, AQI, health) %>%
+   filter(!is.na(health))
+ 
+ logistic_2005
+ 
+# final dataframe containing UHF42, AQI, and Tree Density in 2005
+ 
+ linear_2015
+ 
+ logistic_2015 <- logistic_2015 %>%
+   transmute(UHF42, AQI, health) %>%
+   filter(!is.na(health))
+ 
+ logistic_2015
+
+```
+
+## Models
+
+To explore the relationship between Tree density and Air quality, we make two linear models, one for each of 2005 and 2015
+
+```{r modeling1}
+model_2005 <- lm(AQI ~ `Tree Density`, data = linear_2005)
+
+coef_2005 <- coef(model_2005)
+fitted <- linear_2005 %>% mutate(yend = coef_2005[[1]] + coef_2005[[2]] * `Tree Density`)
+
+ggplot(linear_2005, aes(`Tree Density`, AQI)) + geom_point() + geom_abline(intercept = coef_2005[[1]], slope = coef_2005[[2]]) + 
+  geom_segment(aes(`Tree Density`, AQI, xend = `Tree Density`, yend = yend), fitted, col = "blue", alpha = .5) +
+  labs(x = "Tree Count", y = "AQI", title = "AQI vs. Tree Density (2005)") + theme(plot.title = element_text(hjust = 0.5))
+
+tibble(Year = "2005", Intercept = coef_2005[[1]], Slope = coef_2005[[2]])
+```
+
+```{r modeling2}
+model_2015 <- lm(AQI ~ `Tree Density`, data = linear_2015)
+
+coef_2015 <- coef(model_2015)
+fitted <- linear_2015 %>% mutate(yend = coef_2015[[1]] + coef_2015[[2]] * `Tree Density`)
+
+ggplot(linear_2015, aes(`Tree Density`, AQI)) + geom_point() + geom_abline(intercept = coef_2015[[1]], slope = coef_2015[[2]]) + 
+  geom_segment(aes(`Tree Density`, AQI, xend = `Tree Density`, yend = yend), fitted, col = "blue", alpha = .5) +
+  labs(x = "Tree Count", y = "AQI", title = "AQI vs. Tree Density (2015)") + theme(plot.title = element_text(hjust = 0.5))
+
+tibble(Year = "2015", Intercept = coef_2015[[1]], Slope = coef_2015[[2]])
+```
+
+Note that each point on the graph represents a UHF42 neighborhood. Furthermore, AQI describes the concentration of chemicals in the air. This means a lower AQI is more desireable. As we expected, as the tree count increases, the average chemical concentration in the area decreases.
+
+## Logistic Models
+
+After we labeled the tree entires as "healthy" vs. "unhealthy", we apply a logistic model to predict the probability of a tree being healthy given the AQI of the neighborhood it falls in
+
+```{r log_func}
+add_predictions <- function (data, model, var = "pred", ...) {
+data[[var]] <- stats::predict(model, data, ...)
+data
+}
+```
+
+```{r logistic_2005}
+logistic_2005 <- logistic_2005 %>% mutate(HI = ifelse(health == "Good", 1, 0))
+
+TreeHealth_mod <- glm(HI ~ AQI, data = logistic_2005) 
+grid <- logistic_2005 %>% data_grid(AQI) %>% add_predictions(TreeHealth_mod, type = "response")
+
+ggplot(logistic_2005, aes(AQI)) + geom_jitter(aes(y = HI), width = 0.03, height = 0.06, alpha = 0.007) + geom_line(aes(y = pred), data = grid, color = "red", size = 1) +
+  labs( y = "Health Indicator", title = "Probability of a Tree being healthy given the AQI (2005)") + theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r logistic_2015}
+logistic_2015 <- logistic_2015 %>% mutate(HI = ifelse(health == "Good", 1, 0))
+
+TreeHealth_mod <- glm(HI ~ AQI, data = logistic_2015) 
+grid <- logistic_2015 %>% data_grid(AQI) %>% add_predictions(TreeHealth_mod, type = "response")
+
+ggplot(logistic_2015, aes(AQI)) + geom_jitter(aes(y = HI), width = 0.03, height = 0.06, alpha = 0.007) + geom_line(aes(y = pred), data = grid, color = "red", size = 1) +
+  labs( y = "Health Indicator", title = "Probability of a Tree being healthy given the AQI (2015)") + theme(plot.title = element_text(hjust = 0.5))
+```
+
+As you can see, in both cases, the regression was a horizontal line. That is, the probability of a tree being healthy is actually independent of the air quality of the neighboorhood it lies in.
+
+# Discussion
+
+There are a few things about our analysis worth noting. Notice how the maps did not have any trees where central park lies. This is obviously inconsistent, as it should have one of the highest tree densities in NYC. This stems from the fact that the data was collected in relation to street positions (as detailed in our presentation), and thus there will be no tree entries for locations not on a street. An interesting find, which limits the overall scope of the dataset but still provides significant information to compare street tree trends across New York City.
+
+Furthermore, our Air Quality analysis was very limited due to the nature of the data. It was very inconsitant in the sense that certain chemicals only appeared in certain years. That is each year category has a different set of listings. We searched all over for another NYC air quality dataset but could not find one. Therefore, we could not come up with an accurate Air Quality Index (AQI) to describe the districts. Instead, we calculated AQI by averaging the concentrations of all the chemcials that appeared for that certain year. This, way, we at least have an index that is relatively meaningful (relative to the indices of other areas), which we can use to model Air Quality vs. Tree Density.  
+
+# Interactive App
+
+We built an interactive app that plots the heat maps as shown in our presentation by allowing the user to select the borough and year, and then returning a map of the tree density. The app also includes a second tab of the most common species from that selected borough and year. Our interactive app when ran locally includes all of the data from 1995, 2005, and 2015, but we were only able to include the 2015 data when we hosted the app online, due to space limitations. The 2015 app can be accessed at: https://zthalv.shinyapps.io/NYTrees/ 
+
+(The app takes some time to load the maps so it may appear blank at first)
+
+# Conclusion
+ 
+Looking at the low alpha map, we can see that the highest tree density occurs arround central park in Manhatten. This is to be expected since Central Park is one of the largest parks in the coutry, the density would have only been amplified if the tree data for the park was included. The next highest density seems to appear near North-East Queens.
+
+When it comes to the models, despite the inconsistent air quality data, we still observed a relationship that confirmed our suspicion. In both the 2005 and 2015 models, as the tree count increased, the average chemical concentration in the air (AQI) decreased. Furthermore, upon fitting a logistic model of the trees' health indicator and AQI, we found that the probability of a tree being healthy is actually independent of its neighborhood's average chemical concentration.
